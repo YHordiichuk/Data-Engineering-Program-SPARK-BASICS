@@ -58,13 +58,11 @@ def ghsh_4(cord_list):
     except Exception as e:
         return None
   
-
 def get_lat_lng(address, city, country):
     lat, lng = geo_inst.get_cord(f"{address} {city}, {country}")
     return [float(lat), float(lng)]
 
 ghsh_udf = udf(ghsh_4, StringType())
-
 geo_udf = udf(get_lat_lng, ArrayType(DoubleType()))
 
 
@@ -72,39 +70,33 @@ df_hotels = spark.read.option("header", "true").csv(s3_path_hotels)
 df_weather = spark.read.option("recursiveFileLookup", "true").parquet(s3_path_weather)
 
 print(f"Count rows hotels {df_hotels.count()}")
+print(f"Count rows weather {df_weather.count()}")
 
 df_hotels = df_hotels.withColumn("Latitude", col("Latitude").cast("double")) \
                      .withColumn("Longitude", col("Longitude").cast("double"))
 
-df_missing = df_hotels.filter(
-    (col("Latitude").isNull()) | (col("Latitude") == "") |
-    (col("Longitude").isNull()) | (col("Longitude") == "")
-).select("Id", "Address", "City", "Country").collect()
+df_missing = (
+    df_hotels
+    .filter(col("Latitude").isNull() | col("Longitude").isNull())
+    .select("Address", "City", "Country")
+    .distinct()
+)
 
-print(f"Count of null Lat\Lon {len(df_missing)}")
-
-enriched_geo_results = []
-for row in df_missing:
-    lat, lng = geo_inst.get_cord(f"{row['Address']} {row['City']} {row['Country']}")
-    if lat is not None and lng is not None:
-        enriched_geo_results.append((row['Id'], float(lat), float(lng)))
-df_geo_filled = spark.createDataFrame(enriched_geo_results, schema=["Id", "Latitude_filled", "Longitude_filled"])
-
-print(f"Lat\Lon enriched via API")
+df_enriched = df_missing.withColumn("lat_lng", geo_udf(col("Address"), col("City"), col("Country")))
 
 df_hotels = (
     df_hotels
-    .join(df_geo_filled, on="Id", how="left")
+    .join(df_enriched, on=["Address", "City", "Country"], how="left")
     .withColumn(
         "Latitude",
-        when(col("Latitude").isNull() | (col("Latitude") == ""), col("Latitude_filled")).otherwise(col("Latitude"))
+        when(col("Latitude").isNull(), col("lat_lng")[0]).otherwise(col("Latitude"))
     )
     .withColumn(
         "Longitude",
-        when(col("Longitude").isNull() | (col("Longitude") == ""), col("Longitude_filled")).otherwise(col("Longitude"))
+        when(col("Longitude").isNull(), col("lat_lng")[1]).otherwise(col("Longitude"))
     )
-    .withColumn("geohash", ghsh_udf(array(col("Latitude"), col("Longitude"))))
-    .drop("Latitude_filled", "Longitude_filled")
+    .withColumn("geohash", ghsh_udf(array("Latitude", "Longitude")))
+    .drop("lat_lng")
 )
 
 print(f"df_hotels geohash spark plan calculated")
